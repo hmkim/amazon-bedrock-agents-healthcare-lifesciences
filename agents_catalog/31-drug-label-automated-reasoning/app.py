@@ -8,7 +8,6 @@ import boto3
 import streamlit as st
 from streamlit.logger import get_logger
 
-
 logger = get_logger(__name__)
 logger.setLevel("INFO")
 
@@ -277,10 +276,6 @@ def invoke_agent_streaming(
                         if parsed_chunk.strip():  # Only yield non-empty chunks
                             if "🔧 Using tool:" in parsed_chunk and not show_tool:
                                 yield ""
-                            elif "🔧 Tool input:" in parsed_chunk and not show_tool:
-                                yield ""
-                            elif "🔧 Tool result:" in parsed_chunk and not show_tool:
-                                yield ""
                             else:
                                 yield parsed_chunk
                     else:
@@ -429,12 +424,9 @@ def main():
                         # Format version display with update time
                         version_display = f"v{version_num}"
                         if updated:
-                            try:
-                                if hasattr(updated, "strftime"):
-                                    updated_str = updated.strftime("%m/%d %H:%M")
-                                    version_display += f" ({updated_str})"
-                            except:
-                                pass
+                            if hasattr(updated, "strftime"):
+                                updated_str = updated.strftime("%m/%d %H:%M")
+                                version_display += f" ({updated_str})"
 
                         version_options.append(version_display)
                         version_arn_map[version_display] = {
@@ -601,7 +593,7 @@ def main():
                         else:
                             # Show raw response
                             message_placeholder.markdown(chunk_buffer + " ▌")
-                    # nosemgrep sleep to wait for resources
+                    # nosemgrep arbitrary-sleep
                     time.sleep(0.01)  # Reduced delay since we're batching updates
 
                 # Final response without cursor
