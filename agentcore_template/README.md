@@ -216,6 +216,54 @@ rm .agentcore.yaml
 rm .bedrock_agentcore.yaml
 ```
 
+## 📚 Additional Documentation
+
+- **[Best Practices Guide](BEST_PRACTICES.md)**: Comprehensive guide on AWS best practices for production-ready agents
+- **[Troubleshooting Guide](TROUBLESHOOTING.md)**: Common issues and solutions
+- **[Contributing Guidelines](../../CONTRIBUTING.md)**: How to contribute to this project
+
+### Key Features and Best Practices
+
+This template implements AWS best practices for healthcare and life sciences agents:
+
+✅ **Security**
+- Input validation and sanitization
+- Secure credential management with AWS Systems Manager
+- OAuth/IAM authentication options
+- No hardcoded secrets
+
+✅ **Reliability**
+- Comprehensive error handling
+- Retry logic with exponential backoff
+- Health check system
+- Graceful degradation
+
+✅ **Observability**
+- Structured logging throughout
+- Health monitoring endpoints
+- OpenTelemetry integration
+- CloudWatch metrics support
+
+✅ **Testing**
+- Unit tests with pytest
+- Integration tests
+- Mock AWS services
+- >80% code coverage
+
+✅ **Configuration Management**
+- Environment-based configuration
+- Centralized config validation
+- Type-safe settings
+- Support for multiple environments
+
+✅ **Performance**
+- Async operations for streaming
+- Connection pooling
+- Configurable timeouts
+- Resource optimization
+
+For detailed information on implemented best practices, see [BEST_PRACTICES.md](BEST_PRACTICES.md).
+
 ## 🤝 Contributing
 
 We welcome contributions! Please see our [Contributing Guidelines](../../CONTRIBUTING.md) for details.

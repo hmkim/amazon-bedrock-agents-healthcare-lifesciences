@@ -1,0 +1,142 @@
+# pyproject.toml - Python project configuration
+
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentcore-template"
+version = "1.0.0"
+description = "AWS AgentCore template for healthcare and life sciences agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT-0"}
+authors = [
+    {name = "AWS Samples", email = "aws-samples@amazon.com"}
+]
+keywords = ["aws", "bedrock", "agentcore", "healthcare", "life-sciences", "ai"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/aws-samples/amazon-bedrock-agents-healthcare-lifesciences"
+Documentation = "https://github.com/aws-samples/amazon-bedrock-agents-healthcare-lifesciences/tree/main/agentcore_template"
+Repository = "https://github.com/aws-samples/amazon-bedrock-agents-healthcare-lifesciences"
+Issues = "https://github.com/aws-samples/amazon-bedrock-agents-healthcare-lifesciences/issues"
+
+# Tool configurations
+
+[tool.black]
+line-length = 100
+target-version = ['py310', 'py311', 'py312']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 100
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+ensure_newline_before_comments = true
+skip_glob = ["*/node_modules/*", "*/.venv/*", "*/build/*", "*/dist/*"]
+
+[tool.flake8]
+max-line-length = 100
+extend-ignore = ["E203", "E501", "W503"]
+exclude = [
+    ".git",
+    "__pycache__",
+    "build",
+    "dist",
+    ".venv",
+    ".eggs",
+    "*.egg"
+]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = true
+ignore_missing_imports = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+ignore_errors = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "-v -ra --strict-markers"
+markers = [
+    "unit: Unit tests that don't require AWS services",
+    "integration: Integration tests that may require AWS services",
+    "slow: Slow tests that take significant time to run",
+    "aws: Tests that interact with AWS services"
+]
+
+[tool.coverage.run]
+source = ["agent", "scripts"]
+omit = [
+    "*/tests/*",
+    "*/__pycache__/*",
+    "*/.venv/*",
+    "*/build/*",
+    "*/dist/*"
+]
+
+[tool.coverage.report]
+precision = 2
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod"
+]
+
+[tool.coverage.html]
+directory = "htmlcov"
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv", "build", "dist"]
+skips = ["B101", "B601"]  # Skip assert_used and paramiko warnings
+
+[tool.bandit.assert_used]
+exclude = ["*_test.py", "**/test_*.py"]

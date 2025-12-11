@@ -1,0 +1,40 @@
+# yamllint configuration
+
+extends: default
+
+rules:
+  # Line length
+  line-length:
+    max: 120
+    level: warning
+
+  # Indentation
+  indentation:
+    spaces: 2
+    indent-sequences: true
+
+  # Document start/end markers
+  document-start: disable
+  document-end: disable
+
+  # Comments
+  comments:
+    min-spaces-from-content: 1
+
+  # Trailing spaces
+  trailing-spaces: enable
+
+  # Empty lines
+  empty-lines:
+    max: 2
+
+  # Truthy values
+  truthy:
+    allowed-values: ['true', 'false', 'yes', 'no']
+    check-keys: false
+
+ignore: |
+  .venv/
+  node_modules/
+  build/
+  dist/
