@@ -8,8 +8,8 @@ from strands.models import BedrockModel
 from bedrock_agentcore_starter_toolkit import Runtime
 from boto3.session import Session
 
-# Import everything from vcf_interpreters
-from genomics_store_interpreters import *
+# Import everything from tools module
+from .tools.genomics_store_interpreters import *
 
 boto_session = Session()
 # Define the model

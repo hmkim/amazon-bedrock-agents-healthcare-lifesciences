@@ -9,3 +9,16 @@ node_modules
 __pycache__
 *-packaged.yaml
 tasks.md
+
+# Variant Agent - exclude data/logs
+agents_catalog/17-variant-interpreter-agent/*.log
+agents_catalog/17-variant-interpreter-agent/*.tar.gz
+agents_catalog/17-variant-interpreter-agent/*.vcf.gz
+agents_catalog/17-variant-interpreter-agent/homo_sapiens/
+agents_catalog/17-variant-interpreter-agent/cfn-*.txt
+agents_catalog/17-variant-interpreter-agent/cfn-*.json
+agents_catalog/17-variant-interpreter-agent/*.zip
+agents_catalog/17-variant-interpreter-agent/advanced-strands-agentcore/*.log
+agents_catalog/17-variant-interpreter-agent/advanced-strands-agentcore/*.bak
+agents_catalog/17-variant-interpreter-agent/advanced-strands-agentcore/static/
+agents_catalog/17-variant-interpreter-agent/advanced-strands-agentcore/.bedrock_agentcore.yaml

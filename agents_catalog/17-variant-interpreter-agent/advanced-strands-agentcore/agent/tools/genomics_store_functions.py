@@ -14,6 +14,274 @@ import re
 import pandas as pd
 from botocore.exceptions import ClientError, NoCredentialsError, NoRegionError
 
+# PyIceberg for S3 Tables direct access
+try:
+    from pyiceberg.catalog import load_catalog
+    import pyarrow.compute as pc
+    PYICEBERG_AVAILABLE = True
+except ImportError:
+    PYICEBERG_AVAILABLE = False
+    print("⚠️ PyIceberg not available - S3 Tables direct access disabled")
+
+# S3 Tables configuration (set via environment variables)
+S3TABLES_BUCKET_ARN = os.environ.get('S3TABLES_BUCKET_ARN', '')
+S3TABLES_NAMESPACE = os.environ.get('S3TABLES_NAMESPACE', 'variant_db')
+S3TABLES_TABLE = os.environ.get('S3TABLES_TABLE', 'genomic_variants')
+
+def get_s3tables_catalog():
+    """Get PyIceberg catalog for S3 Tables"""
+    if not PYICEBERG_AVAILABLE:
+        print("⚠️ PyIceberg not available")
+        return None
+    try:
+        print(f"🔄 Connecting to S3 Tables: {S3TABLES_BUCKET_ARN}")
+
+        # Get credentials from boto3 session (works with ECS task role)
+        session = boto3.Session()
+        credentials = session.get_credentials()
+        frozen_credentials = credentials.get_frozen_credentials()
+
+        region = os.environ.get('AWS_REGION', 'us-east-1')
+        catalog_config = {
+            "type": "rest",
+            "warehouse": S3TABLES_BUCKET_ARN,
+            "uri": f"https://s3tables.{region}.amazonaws.com/iceberg",
+            "rest.sigv4-enabled": "true",
+            "rest.signing-name": "s3tables",
+            "rest.signing-region": region,
+        }
+
+        # Add explicit credentials if available (for container environments)
+        if frozen_credentials.access_key:
+            catalog_config["s3.access-key-id"] = frozen_credentials.access_key
+            catalog_config["s3.secret-access-key"] = frozen_credentials.secret_key
+            if frozen_credentials.token:
+                catalog_config["s3.session-token"] = frozen_credentials.token
+            print("✅ Using explicit AWS credentials from session")
+
+        catalog = load_catalog("s3tables", **catalog_config)
+        print("✅ S3 Tables catalog connected successfully")
+        return catalog
+    except Exception as e:
+        print(f"❌ Error loading S3 Tables catalog: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def query_s3tables_direct(filter_expr=None, columns=None, limit=None):
+    """
+    Query S3 Tables directly using PyIceberg (bypasses Athena/Lake Formation)
+
+    Args:
+        filter_expr: PyArrow filter expression or None for all data
+        columns: List of column names to select, or None for all
+        limit: Maximum number of rows to return
+
+    Returns:
+        List of dictionaries with query results
+    """
+    try:
+        catalog = get_s3tables_catalog()
+        if not catalog:
+            return []
+
+        table = catalog.load_table(f"{S3TABLES_NAMESPACE}.{S3TABLES_TABLE}")
+        scan = table.scan()
+        df = scan.to_arrow()
+
+        # Apply column selection
+        if columns:
+            df = df.select(columns)
+
+        # Apply filter if provided
+        if filter_expr is not None:
+            df = df.filter(filter_expr)
+
+        # Apply limit
+        if limit:
+            df = df.slice(0, limit)
+
+        # Convert to list of dicts
+        return df.to_pylist()
+    except Exception as e:
+        print(f"Error querying S3 Tables: {e}")
+        return []
+
+def get_sample_counts_from_s3tables():
+    """Get variant counts per sample from S3 Tables - optimized to only scan sample_name column"""
+    try:
+        import sys
+        sys.stdout.flush()
+        print("🔄 Getting sample counts from S3 Tables...", flush=True)
+        catalog = get_s3tables_catalog()
+        if not catalog:
+            print("❌ No catalog available", flush=True)
+            return {}
+
+        table_id = f"{S3TABLES_NAMESPACE}.{S3TABLES_TABLE}"
+        print(f"🔄 Loading table: {table_id}", flush=True)
+        table = catalog.load_table(table_id)
+        print(f"✅ Table loaded, scanning only sample_name column...", flush=True)
+
+        # Only select sample_name column for efficiency (avoids loading all 25M+ rows of all columns)
+        df = table.scan(selected_fields=("sample_name",)).to_arrow()
+        print(f"✅ Scan complete, {len(df)} rows", flush=True)
+
+        counts = pc.value_counts(df['sample_name'])
+        result = {name: count for name, count in
+                zip(counts.field('values').to_pylist(), counts.field('counts').to_pylist())}
+        print(f"✅ Found {len(result)} samples: {list(result.keys())}", flush=True)
+        return result
+    except Exception as e:
+        print(f"❌ Error getting sample counts: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        return {}
+
+def query_variants_by_chromosome_s3tables(chromosome: str, sample_name: str = None, limit: int = 100):
+    """Query variants by chromosome from S3 Tables using PyIceberg"""
+    try:
+        print(f"🔄 Querying variants for chromosome {chromosome}...", flush=True)
+        catalog = get_s3tables_catalog()
+        if not catalog:
+            return {"error": "Could not connect to S3 Tables"}
+
+        table = catalog.load_table(f"{S3TABLES_NAMESPACE}.{S3TABLES_TABLE}")
+
+        # Normalize chromosome format (accept both "17" and "chr17")
+        chrom = chromosome if chromosome.startswith("chr") else f"chr{chromosome}"
+
+        # Build filter
+        from pyiceberg.expressions import EqualTo, And
+        row_filter = EqualTo("chrom", chrom)
+        if sample_name:
+            row_filter = And(row_filter, EqualTo("sample_name", sample_name))
+
+        print(f"🔄 Scanning for chrom={chrom}, sample={sample_name}, limit={limit}...", flush=True)
+
+        # Query with filter and limit
+        df = table.scan(
+            row_filter=row_filter,
+            selected_fields=("sample_name", "variant_name", "chrom", "pos", "ref", "alt", "qual", "filter", "info"),
+            limit=limit
+        ).to_arrow()
+
+        print(f"✅ Found {len(df)} variants", flush=True)
+
+        # Convert to list of dicts
+        results = []
+        for i in range(len(df)):
+            row = {
+                "sample_name": str(df["sample_name"][i]),
+                "variant_name": str(df["variant_name"][i]),
+                "chrom": str(df["chrom"][i]),
+                "pos": int(df["pos"][i].as_py()),
+                "ref": str(df["ref"][i]),
+                "alt": df["alt"][i].as_py(),
+                "qual": float(df["qual"][i].as_py()) if df["qual"][i].as_py() else None,
+                "filter": str(df["filter"][i]),
+            }
+            # Parse VEP annotation from info
+            info_dict = dict(df["info"][i].as_py()) if df["info"][i].as_py() else {}
+            if "CSQ" in info_dict:
+                row["vep_annotation"] = info_dict["CSQ"][:200] + "..." if len(info_dict.get("CSQ", "")) > 200 else info_dict.get("CSQ", "")
+            results.append(row)
+
+        # Get chromosome stats
+        chrom_df = table.scan(
+            row_filter=row_filter,
+            selected_fields=("sample_name",)
+        ).to_arrow()
+        total_count = len(chrom_df)
+
+        return {
+            "analysis_type": f"Chromosome {chromosome} Variants",
+            "chromosome": chrom,
+            "sample_filter": sample_name,
+            "total_variants": total_count,
+            "returned_variants": len(results),
+            "limit": limit,
+            "results": results,
+            "source": "s3_tables_pyiceberg"
+        }
+
+    except Exception as e:
+        print(f"❌ Error querying chromosome variants: {type(e).__name__}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e)}
+
+def query_variants_by_gene_s3tables(gene_symbol: str, sample_name: str = None, limit: int = 50):
+    """Query variants by gene symbol from S3 Tables using PyIceberg (searches VEP CSQ annotations)"""
+    try:
+        print(f"🔄 Querying variants for gene {gene_symbol}...", flush=True)
+        catalog = get_s3tables_catalog()
+        if not catalog:
+            return {"error": "Could not connect to S3 Tables"}
+
+        table = catalog.load_table(f"{S3TABLES_NAMESPACE}.{S3TABLES_TABLE}")
+
+        # Build filter for sample if provided
+        from pyiceberg.expressions import EqualTo
+        row_filter = EqualTo("sample_name", sample_name) if sample_name else None
+
+        # Scan and filter by gene in VEP annotation (CSQ field in info)
+        # Note: PyIceberg doesn't support filtering on map fields, so we need to scan and filter in Python
+        print(f"🔄 Scanning variants and filtering for gene {gene_symbol}...", flush=True)
+
+        scan_kwargs = {
+            "selected_fields": ("sample_name", "variant_name", "chrom", "pos", "ref", "alt", "qual", "filter", "info"),
+            "limit": 10000  # Scan more rows to find gene matches
+        }
+        if row_filter:
+            scan_kwargs["row_filter"] = row_filter
+
+        df = table.scan(**scan_kwargs).to_arrow()
+
+        # Filter by gene in VEP annotation
+        gene_upper = gene_symbol.upper()
+        results = []
+        for i in range(len(df)):
+            info_dict = dict(df["info"][i].as_py()) if df["info"][i].as_py() else {}
+            csq = info_dict.get("CSQ", "")
+
+            # Check if gene symbol is in the CSQ annotation
+            if gene_upper in csq.upper():
+                row = {
+                    "sample_name": str(df["sample_name"][i]),
+                    "variant_name": str(df["variant_name"][i]),
+                    "chrom": str(df["chrom"][i]),
+                    "pos": int(df["pos"][i].as_py()),
+                    "ref": str(df["ref"][i]),
+                    "alt": df["alt"][i].as_py(),
+                    "qual": float(df["qual"][i].as_py()) if df["qual"][i].as_py() else None,
+                    "filter": str(df["filter"][i]),
+                    "vep_annotation": csq[:300] + "..." if len(csq) > 300 else csq
+                }
+                results.append(row)
+
+                if len(results) >= limit:
+                    break
+
+        print(f"✅ Found {len(results)} variants for gene {gene_symbol}", flush=True)
+
+        return {
+            "analysis_type": f"Gene {gene_symbol} Variants",
+            "gene": gene_symbol,
+            "sample_filter": sample_name,
+            "total_variants_found": len(results),
+            "limit": limit,
+            "results": results,
+            "source": "s3_tables_pyiceberg",
+            "note": "Variants filtered by VEP CSQ annotation containing gene symbol"
+        }
+
+    except Exception as e:
+        print(f"❌ Error querying gene variants: {type(e).__name__}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e)}
+
 def validate_sql_input(value):
     """Validate input to prevent SQL injection - only allow alphanumeric and safe characters"""
     if not isinstance(value, str):
@@ -22,6 +290,336 @@ def validate_sql_input(value):
     if not re.match(r'^[a-zA-Z0-9_.-]+$', value):
         raise ValueError(f"Invalid input: {value}. Only alphanumeric characters, underscore, hyphen, and dot are allowed.")
     return value
+
+# === ATHENA S3 TABLES QUERY FUNCTIONS ===
+# S3 Tables Athena configuration (set via environment variables)
+S3TABLES_CATALOG = os.environ.get('S3TABLES_CATALOG', 's3tablescatalog/genomics-variant-tables')
+S3TABLES_DATABASE = os.environ.get('S3TABLES_DATABASE', 'variant_db')
+S3TABLES_ATHENA_OUTPUT = os.environ.get('S3TABLES_ATHENA_OUTPUT', '')
+
+def query_s3tables_athena(sql_query: str, timeout_seconds: int = 60):
+    """
+    Execute an Athena query on S3 Tables using s3tablescatalog.
+
+    Args:
+        sql_query: SQL query to execute
+        timeout_seconds: Maximum time to wait for query completion
+
+    Returns:
+        Dict with query results or error
+    """
+    try:
+        athena = boto3.client('athena', region_name='us-east-1')
+
+        print(f"🔄 Executing Athena query on S3 Tables...", flush=True)
+        print(f"   Catalog: {S3TABLES_CATALOG}", flush=True)
+        print(f"   Query: {sql_query[:200]}...", flush=True)
+
+        # Start query execution
+        response = athena.start_query_execution(
+            QueryString=sql_query,
+            QueryExecutionContext={
+                'Catalog': S3TABLES_CATALOG,
+                'Database': S3TABLES_DATABASE
+            },
+            ResultConfiguration={
+                'OutputLocation': S3TABLES_ATHENA_OUTPUT
+            },
+            WorkGroup='primary'
+        )
+
+        query_execution_id = response['QueryExecutionId']
+        print(f"   Query ID: {query_execution_id}", flush=True)
+
+        # Wait for query completion
+        start_time = time.time()
+        while True:
+            status_response = athena.get_query_execution(QueryExecutionId=query_execution_id)
+            status = status_response['QueryExecution']['Status']['State']
+
+            if status in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+                break
+
+            if time.time() - start_time > timeout_seconds:
+                return {"error": f"Query timed out after {timeout_seconds} seconds"}
+
+            time.sleep(1)
+
+        if status == 'FAILED':
+            error_message = status_response['QueryExecution']['Status'].get('StateChangeReason', 'Unknown error')
+            return {"error": f"Query failed: {error_message}"}
+
+        if status == 'CANCELLED':
+            return {"error": "Query was cancelled"}
+
+        # Get results
+        results_response = athena.get_query_results(QueryExecutionId=query_execution_id)
+
+        # Parse results
+        columns = []
+        rows = []
+
+        result_set = results_response.get('ResultSet', {})
+        result_rows = result_set.get('Rows', [])
+
+        if result_rows:
+            # First row is headers
+            columns = [col.get('VarCharValue', '') for col in result_rows[0].get('Data', [])]
+
+            # Remaining rows are data
+            for row in result_rows[1:]:
+                row_data = {}
+                for i, col in enumerate(row.get('Data', [])):
+                    if i < len(columns):
+                        row_data[columns[i]] = col.get('VarCharValue', '')
+                rows.append(row_data)
+
+        print(f"✅ Query returned {len(rows)} rows", flush=True)
+
+        return {
+            "success": True,
+            "query_execution_id": query_execution_id,
+            "columns": columns,
+            "row_count": len(rows),
+            "results": rows,
+            "source": "athena_s3tables"
+        }
+
+    except Exception as e:
+        print(f"❌ Athena query error: {type(e).__name__}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e)}
+
+def query_variants_by_chromosome_athena(chromosome: str, sample_name: str = None, limit: int = 100):
+    """
+    Query variants by chromosome from S3 Tables using Athena.
+
+    Args:
+        chromosome: Chromosome identifier (e.g., "17", "chr17")
+        sample_name: Optional sample name to filter
+        limit: Maximum number of results
+
+    Returns:
+        Dict with query results
+    """
+    # Normalize chromosome format
+    chrom = chromosome if chromosome.startswith("chr") else f"chr{chromosome}"
+
+    # Build SQL query
+    sql = f"""
+    SELECT sample_name, variant_name, chrom, pos, ref, alt, qual, filter, info
+    FROM genomic_variants
+    WHERE chrom = '{chrom}'
+    """
+
+    if sample_name:
+        sample_name = validate_sql_input(sample_name)
+        sql += f"AND sample_name = '{sample_name}'\n"
+
+    sql += f"ORDER BY pos\nLIMIT {int(limit)}"
+
+    result = query_s3tables_athena(sql)
+
+    if "error" in result:
+        return result
+
+    # Also get total count
+    count_sql = f"""
+    SELECT COUNT(*) as total_count
+    FROM genomic_variants
+    WHERE chrom = '{chrom}'
+    """
+    if sample_name:
+        count_sql += f"AND sample_name = '{sample_name}'"
+
+    count_result = query_s3tables_athena(count_sql)
+    total_count = 0
+    if count_result.get("results"):
+        total_count = int(count_result["results"][0].get("total_count", 0))
+
+    return {
+        "analysis_type": f"Chromosome {chromosome} Variants (Athena)",
+        "chromosome": chrom,
+        "sample_filter": sample_name,
+        "total_variants": total_count,
+        "returned_variants": result.get("row_count", 0),
+        "limit": limit,
+        "results": result.get("results", []),
+        "source": "athena_s3tables"
+    }
+
+def query_variants_by_gene_athena(gene_symbol: str, sample_name: str = None, limit: int = 50):
+    """
+    Query variants by gene symbol from S3 Tables using Athena (searches VEP CSQ annotations).
+
+    Args:
+        gene_symbol: Gene symbol (e.g., "BRCA1", "TP53")
+        sample_name: Optional sample name to filter
+        limit: Maximum number of results
+
+    Returns:
+        Dict with query results
+    """
+    gene_symbol = validate_sql_input(gene_symbol)
+
+    # Build SQL query - search for gene in info field (contains CSQ annotation)
+    sql = f"""
+    SELECT sample_name, variant_name, chrom, pos, ref, alt, qual, filter, info
+    FROM genomic_variants
+    WHERE info['CSQ'] LIKE '%{gene_symbol.upper()}%'
+    """
+
+    if sample_name:
+        sample_name = validate_sql_input(sample_name)
+        sql += f"AND sample_name = '{sample_name}'\n"
+
+    sql += f"LIMIT {int(limit)}"
+
+    result = query_s3tables_athena(sql)
+
+    if "error" in result:
+        return result
+
+    return {
+        "analysis_type": f"Gene {gene_symbol} Variants (Athena)",
+        "gene": gene_symbol,
+        "sample_filter": sample_name,
+        "total_variants_found": result.get("row_count", 0),
+        "limit": limit,
+        "results": result.get("results", []),
+        "source": "athena_s3tables",
+        "note": "Variants filtered by VEP CSQ annotation containing gene symbol"
+    }
+
+def get_sample_summary_athena():
+    """Get summary of samples and variant counts using Athena on S3 Tables."""
+    sql = """
+    SELECT sample_name, COUNT(*) as variant_count
+    FROM genomic_variants
+    GROUP BY sample_name
+    ORDER BY variant_count DESC
+    """
+
+    result = query_s3tables_athena(sql)
+
+    if "error" in result:
+        return result
+
+    return {
+        "analysis_type": "Sample Summary (Athena)",
+        "samples": result.get("results", []),
+        "total_samples": len(result.get("results", [])),
+        "source": "athena_s3tables"
+    }
+
+def analyze_allele_frequencies_athena(sample_names: list = None, frequency_threshold: float = 0.01):
+    """
+    Analyze allele frequencies using Athena on S3 Tables.
+
+    Args:
+        sample_names: Optional list of sample names to filter
+        frequency_threshold: Frequency threshold for rare variant analysis (default: 0.01 = 1%)
+
+    Returns:
+        Dict with frequency analysis results
+    """
+    # Build SQL query for frequency analysis
+    sql = """
+    SELECT
+        sample_name,
+        chrom,
+        COUNT(*) as variant_count,
+        SUM(CASE WHEN filter = 'PASS' THEN 1 ELSE 0 END) as pass_variants,
+        AVG(CAST(qual AS DOUBLE)) as avg_quality
+    FROM genomic_variants
+    """
+
+    if sample_names and len(sample_names) > 0:
+        samples_str = ",".join([f"'{validate_sql_input(s)}'" for s in sample_names])
+        sql += f"WHERE sample_name IN ({samples_str})\n"
+
+    sql += """
+    GROUP BY sample_name, chrom
+    ORDER BY sample_name, chrom
+    LIMIT 200
+    """
+
+    result = query_s3tables_athena(sql)
+
+    if "error" in result:
+        return result
+
+    return {
+        "analysis_type": "Allele Frequency Analysis (Athena)",
+        "sample_filter": sample_names,
+        "frequency_threshold": frequency_threshold,
+        "results": result.get("results", []),
+        "total_records": result.get("row_count", 0),
+        "source": "athena_s3tables",
+        "note": "Frequency analysis by chromosome per sample"
+    }
+
+def compare_sample_variants_athena(sample_names: list):
+    """
+    Compare variant profiles between multiple samples using Athena.
+
+    Args:
+        sample_names: List of sample names to compare (minimum 2 required)
+
+    Returns:
+        Dict with sample comparison results
+    """
+    if not sample_names or len(sample_names) < 2:
+        return {"error": "At least 2 sample names are required for comparison"}
+
+    # Validate sample names
+    validated_samples = [validate_sql_input(s) for s in sample_names]
+    samples_str = ",".join([f"'{s}'" for s in validated_samples])
+
+    # Query for variant counts per sample
+    count_sql = f"""
+    SELECT sample_name, COUNT(*) as variant_count
+    FROM genomic_variants
+    WHERE sample_name IN ({samples_str})
+    GROUP BY sample_name
+    """
+
+    count_result = query_s3tables_athena(count_sql)
+
+    # Query for chromosome distribution
+    chrom_sql = f"""
+    SELECT sample_name, chrom, COUNT(*) as variant_count
+    FROM genomic_variants
+    WHERE sample_name IN ({samples_str})
+    GROUP BY sample_name, chrom
+    ORDER BY sample_name, variant_count DESC
+    LIMIT 100
+    """
+
+    chrom_result = query_s3tables_athena(chrom_sql)
+
+    # Query for shared variants (same position)
+    shared_sql = f"""
+    SELECT chrom, pos, ref, alt, COUNT(DISTINCT sample_name) as sample_count
+    FROM genomic_variants
+    WHERE sample_name IN ({samples_str})
+    GROUP BY chrom, pos, ref, alt
+    HAVING COUNT(DISTINCT sample_name) > 1
+    LIMIT 50
+    """
+
+    shared_result = query_s3tables_athena(shared_sql)
+
+    return {
+        "analysis_type": "Sample Comparison Analysis (Athena)",
+        "samples_compared": validated_samples,
+        "sample_counts": count_result.get("results", []),
+        "chromosome_distribution": chrom_result.get("results", []),
+        "shared_variants": shared_result.get("results", []),
+        "shared_variant_count": shared_result.get("row_count", 0),
+        "source": "athena_s3tables"
+    }
 
 # Initialize AWS configuration with comprehensive error handling
 def get_aws_config():
@@ -191,28 +789,46 @@ def get_annotation_store_info():
 
 def execute_athena_query_on_stores(query, database=None):
     """
-    Execute Athena query on genomics stores using default database
+    Execute Athena query on S3 Tables genomics data
+    Uses S3 Tables catalog for querying Iceberg tables
     """
     if athena_client is None:
         raise Exception("Athena client not available. Please configure AWS credentials and region.")
-        
+
     try:
         if not database:
-            database = LAKE_FORMATION_DATABASE
-        
-        print(f"Executing query on database '{database}': {query}")
-        
+            database = 'variant_db'
+
+        # S3 Tables bucket name for catalog reference
+        s3tables_bucket = 'genomics-variant-tables'
+        s3tables_catalog = f's3tablescatalog/{s3tables_bucket}'
+
+        # Transform query to use fully qualified S3 Tables catalog path
+        # Replace unqualified table references with S3 Tables catalog path
+        modified_query = query
+        if 'genomic_variants' in query and s3tables_catalog not in query:
+            # Replace simple table reference with fully qualified path
+            modified_query = query.replace(
+                'genomic_variants',
+                f'"{s3tables_catalog}".{database}.genomic_variants'
+            )
+            modified_query = modified_query.replace(
+                'FROM variant_db.',
+                f'FROM "{s3tables_catalog}".'
+            )
+
+        print(f"Executing query on S3 Tables database '{database}': {query}")
+
         # Print the query execution details in the expected format
         print("=" * 84)
-        print(f"Executing query on database '{database}': ")
-        print(f"        {query}")
-        
+        print(f"Executing query on S3 Tables catalog '{s3tables_catalog}': ")
+        print(f"        {modified_query}")
+
         response = athena_client.start_query_execution(
-            QueryString=query,
-            QueryExecutionContext={'Database': database},
+            QueryString=modified_query,
             WorkGroup='primary',
             ResultConfiguration={
-                'OutputLocation': f's3://aws-athena-query-results-{ACCOUNT_ID}-{REGION}/'
+                'OutputLocation': f's3://genomics-vep-output-{ACCOUNT_ID}-{ACCOUNT_ID}-{REGION}/athena-results/'
             }
         )
         
@@ -533,50 +1149,71 @@ def format_dynamic_query_results(query_result):
 
 def get_available_samples_from_variant_store():
     """
-    Get available samples directly from the variant store instead of DynamoDB
+    Get available samples from S3 Tables genomic_variants table
+    Uses PyIceberg for direct access (bypasses Athena/Lake Formation permissions)
     """
     try:
-        # Validate store name
-        validated_store = validate_sql_input(VARIANT_STORE_NAME)
-        
-        # Query the variant store to get unique sample IDs
-        query = f"""
-        SELECT DISTINCT sampleid, COUNT(*) as variant_count
-        FROM {validated_store}
-        GROUP BY sampleid
-        ORDER BY sampleid
+        # Try PyIceberg direct access first (faster and no permission issues)
+        if PYICEBERG_AVAILABLE:
+            sample_counts = get_sample_counts_from_s3tables()
+            if sample_counts:
+                samples = []
+                for sample_name, count in sorted(sample_counts.items()):
+                    samples.append({
+                        'sample_id': sample_name,
+                        'variant_count': count,
+                        'source': 's3_tables_pyiceberg'
+                    })
+
+                response_text = f"Available samples in S3 Tables ({len(samples)} total):\n"
+                for sample in samples:
+                    response_text += f"- {sample['sample_id']}: {sample['variant_count']:,} variants\n"
+
+                return {
+                    'analysis_type': 'Available Samples',
+                    'results': samples,
+                    'summary': response_text,
+                    'total_count': len(samples)
+                }
+
+        # Fallback to Athena query
+        query = """
+        SELECT sample_name, COUNT(*) as variant_count
+        FROM genomic_variants
+        GROUP BY sample_name
+        ORDER BY sample_name
         """
-        
+
         results = execute_athena_query_on_stores(query)
-        
+
         if not results:
             return {
                 'analysis_type': 'Available Samples',
                 'results': [],
-                'summary': 'No samples found in variant store.'
+                'summary': 'No samples found in S3 Tables.'
             }
-        
+
         samples = []
         for row in results:
             samples.append({
-                'sample_id': row['sampleid'],
+                'sample_id': row['sample_name'],
                 'variant_count': int(row['variant_count']),
-                'source': 'variant_store'
+                'source': 's3_tables'
             })
-        
-        response_text = f"Available samples in variant store ({len(samples)} total):\n"
+
+        response_text = f"Available samples in S3 Tables ({len(samples)} total):\n"
         for sample in samples:
             response_text += f"- {sample['sample_id']}: {sample['variant_count']:,} variants\n"
-        
+
         return {
             'analysis_type': 'Available Samples',
             'results': samples,
             'summary': response_text,
             'total_count': len(samples)
         }
-        
+
     except Exception as e:
-        return {'error': f'Error getting samples from variant store: {str(e)}'}
+        return {'error': f'Error getting samples from S3 Tables: {str(e)}'}
 
 
 # === MAIN ANALYSIS FUNCTIONS FOR GENOMICS STORES ===

@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import time
 import uuid
@@ -410,8 +411,10 @@ def main():
         # Agent selection - hardcoded for genomics agent
         st.subheader("Agent Selection")
         
-        # Use the specific genomics agent - REPLACE WITH YOUR AGENT ARN
-        agent_arn = "arn:aws:bedrock-agentcore:<REGION>:<ACCOUNT_ID>:runtime/genomicsapp_agent_name>"
+        # Use the specific genomics agent - Set via AGENT_ARN environment variable
+        agent_arn = os.environ.get('AGENT_ARN', '')
+        if not agent_arn:
+            st.warning("⚠️ AGENT_ARN environment variable not set. Please set it to your agent ARN.")
         
         st.info("🧬 **Genomics Variant Analysis Agent**")
         st.write("**Agent:** genomicsapp_vcf_agent_supervisor")

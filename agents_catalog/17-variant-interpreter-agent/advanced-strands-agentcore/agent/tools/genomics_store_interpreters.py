@@ -7,16 +7,17 @@ from typing import Dict, Any
 from strands import Agent, tool
 from strands.models import BedrockModel
 
-# Import main analysis functions from separate module
+# Import Athena-based analysis functions from separate module
 from .genomics_store_functions import (
     execute_dynamic_query,
     format_dynamic_query_results,
-    query_variants_by_gene_function,
-    query_variants_by_chromosome_function,
-    analyze_allele_frequencies_function,
-    compare_sample_variants_function,
-    get_stores_information,
-    get_available_samples_from_variant_store,
+    # Athena S3 Tables query functions (primary query methods)
+    query_s3tables_athena,
+    query_variants_by_chromosome_athena,
+    query_variants_by_gene_athena,
+    get_sample_summary_athena,
+    analyze_allele_frequencies_athena,
+    compare_sample_variants_athena,
     REGION,
     ACCOUNT_ID,
     VARIANT_STORE_NAME,
@@ -86,126 +87,169 @@ Remember: Focus on clinically actionable insights that can inform patient care, 
 """
 
 @tool
+def list_available_samples() -> str:
+    """
+    List all available samples in the genomic variants database with their variant counts.
+    Use this tool when users ask what samples are available, want to see a list of patients,
+    or need to know which samples can be analyzed.
+
+    Returns:
+        JSON string with list of available samples and their variant counts
+    """
+    try:
+        # Use Athena to query S3 Tables
+        result = get_sample_summary_athena()
+
+        if isinstance(result, dict) and 'error' not in result:
+            result['genomics_context'] = {
+                'query_engine': 'Athena',
+                'catalog': 's3tablescatalog/genomics-variant-tables',
+                'database': 'variant_db',
+                'analysis_type': 'sample_list',
+                'tool_used': '📋 Sample Listing Tool (Athena)'
+            }
+
+        return f"{json.dumps(result, indent=2, default=str)}"
+
+    except Exception as e:
+        return f"Error listing available samples: {str(e)}"
+
+@tool
 def query_variants_by_gene(gene_symbols: str, sample_ids: str = "", include_frequency: bool = True) -> str:
     """
-    Query variants in specific genes with comprehensive clinical annotations.
-    
+    Query variants in specific genes with comprehensive clinical annotations using Athena.
+
     Args:
         gene_symbols: Comma-separated list of gene symbols (e.g., "BRCA1,BRCA2,TP53")
         sample_ids: Optional comma-separated list of sample IDs to filter
         include_frequency: Whether to include 1000 Genomes frequency data
-    
+
     Returns:
         JSON string with gene-specific variant analysis
     """
     try:
         genes = [g.strip().upper() for g in gene_symbols.split(',') if g.strip()]
-        samples = [s.strip() for s in sample_ids.split(',') if s.strip()] if sample_ids else None
-        
-        result = query_variants_by_gene_function(genes, samples, include_frequency)
-        
-        if isinstance(result, dict) and 'error' not in result:
-            result['genomics_context'] = {
-                'variant_store': VARIANT_STORE_NAME,
-                'annotation_store': ANNOTATION_STORE_NAME,
-                'database': LAKE_FORMATION_DATABASE,
+        sample = sample_ids.split(',')[0].strip() if sample_ids else None
+
+        # Use Athena to query S3 Tables
+        all_results = []
+        for gene in genes:
+            result = query_variants_by_gene_athena(gene, sample, limit=50)
+            if isinstance(result, dict) and 'error' not in result:
+                all_results.extend(result.get('results', []))
+
+        combined_result = {
+            'analysis_type': 'Gene Variant Analysis',
+            'genes_queried': genes,
+            'sample_filter': sample,
+            'total_variants_found': len(all_results),
+            'results': all_results[:100],
+            'source': 'athena_s3tables',
+            'genomics_context': {
+                'query_engine': 'Athena',
+                'catalog': 's3tablescatalog/genomics-variant-tables',
                 'analysis_type': 'gene_analysis',
-                'tool_used': '🧬 Gene Variant Analysis Tool'
+                'tool_used': '🧬 Gene Variant Analysis Tool (Athena)'
             }
-        
-        return f"{json.dumps(result, indent=2, default=str)}"
-            
+        }
+
+        return f"{json.dumps(combined_result, indent=2, default=str)}"
+
     except Exception as e:
         return f"Error in gene variant analysis: {str(e)}"
 
 @tool
 def query_variants_by_chromosome(chromosome: str, sample_ids: str = "", position_range: str = "") -> str:
     """
-    Query variants by chromosome with optional position range filtering.
-    
+    Query variants by chromosome with optional position range filtering using Athena.
+
     Args:
-        chromosome: Chromosome identifier (e.g., "1", "X", "Y", "MT")
-        sample_ids: Optional comma-separated list of sample IDs
+        chromosome: Chromosome identifier (e.g., "1", "17", "X", "Y")
+        sample_ids: Optional comma-separated list of sample IDs (uses first one)
         position_range: Optional position range in format "start-end" (e.g., "1000000-2000000")
-    
+
     Returns:
         JSON string with chromosome-specific variant analysis
     """
     try:
-        samples = [s.strip() for s in sample_ids.split(',') if s.strip()] if sample_ids else None
-        pos_range = position_range if position_range else None
-        
-        result = query_variants_by_chromosome_function(chromosome, samples, pos_range)
-        
+        sample = sample_ids.split(',')[0].strip() if sample_ids else None
+
+        # Use Athena to query S3 Tables
+        result = query_variants_by_chromosome_athena(chromosome, sample, limit=100)
+
         if isinstance(result, dict) and 'error' not in result:
             result['genomics_context'] = {
-                'variant_store': VARIANT_STORE_NAME,
-                'annotation_store': ANNOTATION_STORE_NAME,
-                'database': LAKE_FORMATION_DATABASE,
-                'analysis_type': 'chromosome_analysis'
+                'query_engine': 'Athena',
+                'catalog': 's3tablescatalog/genomics-variant-tables',
+                'analysis_type': 'chromosome_analysis',
+                'tool_used': '🧬 Chromosome Variant Analysis Tool (Athena)'
             }
-        
+
         return f"{json.dumps(result, indent=2, default=str)}"
-        
+
     except Exception as e:
         return f"Error in chromosome variant analysis: {str(e)}"
 
 @tool
 def analyze_allele_frequencies(sample_ids: str = "", frequency_threshold: float = 0.01) -> str:
     """
-    Analyze allele frequencies and compare with 1000 Genomes Project data.
-    
+    Analyze allele frequencies using Athena on S3 Tables.
+
     Args:
         sample_ids: Optional comma-separated list of sample IDs
         frequency_threshold: Frequency threshold for rare variant analysis (default: 0.01 = 1%)
-    
+
     Returns:
         JSON string with population frequency analysis
     """
     try:
         samples = [s.strip() for s in sample_ids.split(',') if s.strip()] if sample_ids else None
-        
-        result = analyze_allele_frequencies_function(samples, frequency_threshold)
-        
+
+        # Use Athena to query S3 Tables
+        result = analyze_allele_frequencies_athena(samples, frequency_threshold)
+
         if isinstance(result, dict) and 'error' not in result:
             result['genomics_context'] = {
-                'variant_store': VARIANT_STORE_NAME,
-                'annotation_store': ANNOTATION_STORE_NAME,
-                'database': LAKE_FORMATION_DATABASE,
-                'analysis_type': 'frequency_analysis'
+                'query_engine': 'Athena',
+                'catalog': 's3tablescatalog/genomics-variant-tables',
+                'database': 'variant_db',
+                'analysis_type': 'frequency_analysis',
+                'tool_used': '📊 Allele Frequency Analysis Tool (Athena)'
             }
-        
+
         return f"{json.dumps(result, indent=2, default=str)}"
-        
+
     except Exception as e:
         return f"Error in allele frequency analysis: {str(e)}"
 
 @tool
 def compare_sample_variants(sample_ids: str) -> str:
     """
-    Compare variant profiles between multiple samples for population analysis.
-    
+    Compare variant profiles between multiple samples using Athena.
+
     Args:
         sample_ids: Comma-separated list of sample IDs to compare (minimum 2 required)
-    
+
     Returns:
         JSON string with sample comparison analysis
     """
     try:
         samples = [s.strip() for s in sample_ids.split(',') if s.strip()]
-        
-        result = compare_sample_variants_function(samples)
-        
+
+        # Use Athena to query S3 Tables
+        result = compare_sample_variants_athena(samples)
+
         if isinstance(result, dict) and 'error' not in result:
             result['genomics_context'] = {
-                'variant_store': VARIANT_STORE_NAME,
-                'annotation_store': ANNOTATION_STORE_NAME,
-                'database': LAKE_FORMATION_DATABASE,
-                'analysis_type': 'sample_comparison'
+                'query_engine': 'Athena',
+                'catalog': 's3tablescatalog/genomics-variant-tables',
+                'database': 'variant_db',
+                'analysis_type': 'sample_comparison',
+                'tool_used': '🔬 Sample Comparison Tool (Athena)'
             }
-        
+
         return f"{json.dumps(result, indent=2, default=str)}"
-        
+
     except Exception as e:
         return f"Error in sample comparison: {str(e)}"
 
@@ -237,10 +281,11 @@ def execute_dynamic_genomics_query(user_question: str, sample_ids: str = "") -> 
     except Exception as e:
         return f"Error executing dynamic genomics query: {str(e)}"
 
-# Create list of tools for genomics stores
+# Create list of tools for genomics stores (all using Athena)
 genomics_store_agent_tools = [
+    list_available_samples,
     query_variants_by_gene,
-    query_variants_by_chromosome, 
+    query_variants_by_chromosome,
     analyze_allele_frequencies,
     compare_sample_variants,
     execute_dynamic_genomics_query
